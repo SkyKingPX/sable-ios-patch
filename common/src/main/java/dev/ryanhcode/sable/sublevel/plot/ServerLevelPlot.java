@@ -9,6 +9,7 @@ import dev.ryanhcode.sable.api.sublevel.ServerSubLevelContainer;
 import dev.ryanhcode.sable.api.sublevel.SubLevelContainer;
 import dev.ryanhcode.sable.companion.math.BoundingBox3i;
 import dev.ryanhcode.sable.index.SableTags;
+import dev.ryanhcode.sable.mixinterface.plot.lighting.LevelLightEngineExtension;
 import dev.ryanhcode.sable.mixinterface.plot.serialization.LevelChunkTicksExtension;
 import dev.ryanhcode.sable.platform.SablePlotPlatform;
 import dev.ryanhcode.sable.sublevel.ServerSubLevel;
@@ -61,6 +62,8 @@ public class ServerLevelPlot extends LevelPlot {
             Block.BLOCK_STATE_REGISTRY, BlockState.CODEC, PalettedContainer.Strategy.SECTION_STATES, Blocks.AIR.defaultBlockState()
     );
 
+    public static final boolean USE_SYNCHRONOUS_LIGHT_ENGINE = true;
+
     /**
      * The light engine for this plot
      */
@@ -89,9 +92,14 @@ public class ServerLevelPlot extends LevelPlot {
         super(plotContainer, x, z, logSize, subLevel);
 
         final Level level = subLevel.getLevel();
-        final LevelLightEngine parentLightEngine = level.getLightEngine();
         final ChunkSource chunkSource = level.getChunkSource();
-        this.lightEngine = new LevelLightEngine(chunkSource, parentLightEngine.blockEngine != null, parentLightEngine.skyEngine != null);
+
+        if (USE_SYNCHRONOUS_LIGHT_ENGINE) {
+            final LevelLightEngineExtension parentLightEngine = (LevelLightEngineExtension) level.getLightEngine();
+            this.lightEngine = new LevelLightEngine(chunkSource, parentLightEngine.sable$hasBlockLight(), parentLightEngine.sable$hasSkyight());
+        } else {
+            this.lightEngine = level.getLightEngine();
+        }
     }
 
     /**
@@ -122,15 +130,20 @@ public class ServerLevelPlot extends LevelPlot {
         Sable.LOGGER.error("Recoverable errors when loading plot section [{}, {}, {}]: {}", chunkPos.x, y, chunkPos.z, errorText);
     }
 
+    private void runLightUpdates() {
+        if (USE_SYNCHRONOUS_LIGHT_ENGINE) {
+            do {
+                this.lightEngine.runLightUpdates();
+            } while (this.lightEngine.hasLightWork());
+        }
+    }
+
     /**
      * Ticks this plot, running lighting updates
      */
     @Override
     public void tick() {
-        do {
-            this.lightEngine.runLightUpdates();
-        } while (this.lightEngine.hasLightWork());
-
+        this.runLightUpdates();
         this.contraptions.removeIf(contraption -> !contraption.sable$isValid());
     }
 
@@ -224,8 +237,8 @@ public class ServerLevelPlot extends LevelPlot {
 
         // Update the chunk map if one exists
         if (level.getChunkSource() instanceof final ServerChunkCache cache) {
-           cache.chunkMap.updatingChunkMap.put(globalChunkPos.toLong(), holder);
-           cache.chunkMap.modified = true;
+            cache.chunkMap.updatingChunkMap.put(globalChunkPos.toLong(), holder);
+            cache.chunkMap.modified = true;
         }
 
         super.addChunkHolder(localChunkPos, holder, initializeLighting);
@@ -245,12 +258,9 @@ public class ServerLevelPlot extends LevelPlot {
         level.entityManager.updateChunkStatus(chunk.getPos(), FullChunkStatus.ENTITY_TICKING);
         level.getChunkSource().chunkMap.onFullChunkStatusChange(globalChunkPos, FullChunkStatus.ENTITY_TICKING);
 
-        do {
-            this.lightEngine.runLightUpdates();
-        } while (this.lightEngine.hasLightWork());
+        this.runLightUpdates();
 
         final Iterable<ServerPlayer> players = this.container.getPlayersTracking(globalChunkPos);
-
         for (final ServerPlayer player : players) {
             SubLevelPlayerChunkSender.sendChunk(player.connection::send, this.lightEngine, chunk);
             SubLevelPlayerChunkSender.sendChunkPoiData(level, chunk);
@@ -469,14 +479,16 @@ public class ServerLevelPlot extends LevelPlot {
                         .getOrThrow(ChunkSerializer.ChunkReadException::new);
 
                 final Registry<Biome> biomeRegistry = level.registryAccess().registryOrThrow(Registries.BIOME);
-                final PalettedContainer<Holder<Biome>> biomeContainer = new PalettedContainer<>(biomeRegistry.asHolderIdMap(), biomeRegistry.getHolderOrThrow(this.biome), PalettedContainer.Strategy.SECTION_BIOMES);
+                final PalettedContainer<Holder<Biome>> biomeContainer =
+                        new PalettedContainer<>(biomeRegistry.asHolderIdMap(), biomeRegistry.getHolderOrThrow(this.biome), PalettedContainer.Strategy.SECTION_BIOMES);
 
                 sections[yIndex] = new LevelChunkSection(palettedContainer, biomeContainer);
 
                 final SectionPos sectionPos = SectionPos.of(global, level.getSectionYFromSectionIndex(yIndex));
 
-                final boolean hasBlockLight = this.lightEngine.blockEngine != null && sectionTag.contains("BlockLight", Tag.TAG_BYTE_ARRAY);
-                final boolean hasSkyLight = this.lightEngine.skyEngine != null && level.dimensionType().hasSkyLight() && sectionTag.contains("SkyLight", Tag.TAG_BYTE_ARRAY);
+                final LevelLightEngineExtension lightExt = (LevelLightEngineExtension) this.lightEngine;
+                final boolean hasBlockLight = lightExt.sable$hasBlockLight() && sectionTag.contains("BlockLight", Tag.TAG_BYTE_ARRAY);
+                final boolean hasSkyLight = lightExt.sable$hasSkyight() && level.dimensionType().hasSkyLight() && sectionTag.contains("SkyLight", Tag.TAG_BYTE_ARRAY);
                 if (hasBlockLight || hasSkyLight) {
                     if (!hasLit) {
                         this.lightEngine.retainData(global, true);
@@ -554,9 +566,7 @@ public class ServerLevelPlot extends LevelPlot {
         }
 
         // Before we send the chunks, let's ensure our lighting data is complete
-        do {
-            this.lightEngine.runLightUpdates();
-        } while (this.lightEngine.hasLightWork());
+        this.runLightUpdates();
 
         final SubLevelPhysicsSystem physicsSystem = ((ServerSubLevelContainer) this.container).physicsSystem();
 
